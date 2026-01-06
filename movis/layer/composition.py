@@ -15,6 +15,11 @@ from diskcache import Cache
 from imageio.core.format import Format
 from tqdm import tqdm
 
+import socket
+import subprocess
+import threading
+from imageio.plugins.ffmpeg import get_exe
+
 from ..attribute import Attribute, AttributeType
 from ..effect import Effect
 from ..enum import BlendingMode, CacheType, Direction
@@ -410,33 +415,10 @@ class Composition:
         pixelformat: str = "yuv420p",
         audio: bool = True,
         audio_codec: str = "aac",
-        input_params: list[str] | None = None,
-        output_params: list[str] | None = None,
-        format: str = "mp4",
+        chunk_size: int = 1024 * 1024,
     ) -> Iterator[bytes]:
-        """Renders the composition's contents to bytes directly without creating intermediate files.
-
-        Args:
-            start_time: The start time of the video.
-            end_time: The end time of the video.
-            fps: The frame rate of the video.
-            codec: The codec used to encode the video.
-            pixelformat: The pixel format of the video.
-            audio: A flag specifying whether to include audio.
-            audio_codec: The codec used to encode the audio.
-            input_params: Additional parameters for ffmpeg input (video).
-            output_params: Additional parameters for ffmpeg output.
-            format: Container format (e.g., "mp4", "gif"). Defaults to "mp4".
-
-        Returns:
-            bytes: The rendered video file content.
-        """
-        import subprocess
-        import threading
-        import socket
-        from imageio.plugins.ffmpeg import get_exe
-        # AUDIO_SAMPLING_RATE is imported from .protocol usually
-        # If not available in scope, default to 44100 or use explicit import
+        
+        # protocol 모듈에서 AUDIO_SAMPLING_RATE 가져오기 (실패 시 기본값 44100)
         try:
             from .protocol import AUDIO_SAMPLING_RATE
         except ImportError:
@@ -445,24 +427,30 @@ class Composition:
         if end_time is None:
             end_time = self.duration
 
-        # 1. Prepare Audio Data (in-memory)
+        # 1. 오디오 데이터 준비 및 정제 (NaN/Inf 제거)
         audio_data = None
         if audio:
-            # get_audio returns (2, N) float32 array
             audio_array = self.get_audio(start_time, end_time)
             if audio_array is not None:
-                # Transpose to (N, 2) and convert to raw bytes (float32 little-endian)
+                # NaN 및 Inf를 0으로 치환 (오류 방지)
+                audio_array = np.nan_to_num(
+                    audio_array, nan=0.0, posinf=0.0, neginf=0.0
+                )
+                # AAC 인코더 안정성을 위해 진폭을 -1.0 ~ 1.0 사이로 클리핑
+                audio_array = np.clip(audio_array, -1.0, 1.0)
+                
+                # (Channels, Samples) -> (Samples, Channels)로 전치 후 float32 bytes로 변환
                 audio_data = audio_array.transpose().astype(np.float32).tobytes()
 
-        # 2. Setup Local Socket for Audio Streaming
-        # Since we cannot easily pipe two input streams via stdin, we use a TCP socket for audio.
+        # 2. 오디오 스트리밍을 위한 TCP 소켓 설정
+        # (stdin과 분리하여 데이터 섞임 방지)
         server_socket = None
         audio_thread = None
         audio_url = None
 
         if audio_data is not None:
             server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            # Bind to localhost with an ephemeral port
+            # 0번 포트를 사용하여 운영체제로부터 사용 가능한 포트 자동 할당
             server_socket.bind(('127.0.0.1', 0))
             server_socket.listen(1)
             port = server_socket.getsockname()[1]
@@ -480,104 +468,90 @@ class Composition:
             audio_thread = threading.Thread(target=feed_audio, daemon=True)
             audio_thread.start()
 
-        # 3. Construct FFmpeg Command
-        cmd = [get_exe(), '-y']
-
-        # Input 0: Video (Raw frames via stdin)
-        if input_params:
-            cmd.extend(input_params)
-        
-        cmd.extend([
+        # 3. FFmpeg 명령어 구성
+        cmd = [
+            get_exe(),
+            '-y',
+            # 입력 0: 비디오 (stdin)
             '-f', 'rawvideo',
             '-vcodec', 'rawvideo',
             '-s', f'{self.size[0]}x{self.size[1]}',
-            '-pix_fmt', 'rgba',  # movis renders in RGBA
+            '-pix_fmt', 'rgba',   # movis의 기본 출력은 RGBA
             '-r', str(fps),
-            '-i', '-',  # Read from stdin
-        ])
+            '-i', '-',
+        ]
 
-        # Input 1: Audio (Raw samples via TCP)
+        # 입력 1: 오디오 (TCP 소켓)
         if audio_url:
             cmd.extend([
-                '-f', 'f32le',       # Float 32-bit Little Endian
+                '-f', 'f32le',    # float 32-bit little endian
                 '-ar', str(AUDIO_SAMPLING_RATE),
-                '-ac', '2',          # Stereo
+                '-ac', '2',       # Stereo
                 '-i', audio_url
             ])
 
-        # Output configuration
-        if output_params:
-            cmd.extend(output_params)
-        
+        # 출력 설정
         cmd.extend([
             '-c:v', codec,
             '-pix_fmt', pixelformat,
+            '-movflags', 'frag_keyframe+empty_moov', # 스트리밍을 위한 mp4 설정
         ])
-        
+
         if audio_url:
             cmd.extend(['-c:a', audio_codec])
-        
-        # Ensure output is streamable (important for bytes/pipes)
-        if format == 'mp4':
-            cmd.extend(['-movflags', 'frag_keyframe+empty_moov'])
-        
+
         cmd.extend([
-            '-f', format,
-            '-'  # Write to stdout
+            '-f', 'mp4',
+            '-'  # stdout으로 출력
         ])
 
-        # 4. Run FFmpeg and Feed Video Frames
+        # 4. FFmpeg 프로세스 시작
+        # bufsize=0을 사용하여 파이프 버퍼링 지연을 최소화
         process = subprocess.Popen(
-            cmd, 
-            stdin=subprocess.PIPE, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.PIPE
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0, 
         )
 
-        # 5. Video Feeder Thread Definition
-        # 메인 스레드가 stdout을 읽는 동안, 이 스레드는 stdin에 데이터를 씁니다.
+        # 5. 비디오 프레임 공급 스레드
         video_exception = None
 
         def feed_video_frames():
             nonlocal video_exception
             try:
                 times = np.arange(start_time, end_time, 1.0 / fps)
-                # 진행 상황을 보고 싶다면 tqdm 사용 가능 (stderr로 출력됨)
-                # from tqdm import tqdm
-                # for t in tqdm(times, desc="Rendering"):
                 for t in times:
+                    # 프레임 렌더링
                     frame = np.asarray(self(t, bg_color=(0, 0, 0, 255)))
+                    # 바이트로 변환하여 stdin에 쓰기
                     process.stdin.write(frame.tobytes())
                 process.stdin.close()
             except Exception as e:
                 video_exception = e
                 process.kill()
 
-        video_thread = threading.Thread(target=feed_video_frames)
+        video_thread = threading.Thread(target=feed_video_frames, daemon=True)
         video_thread.start()
-        
-        # 6. Output Generator Loop (Main Thread)
+
+        # 6. 결과 출력 루프 (Main Thread)
         try:
             while True:
-                # chunk_size 만큼 읽어서 yield
                 chunk = process.stdout.read(chunk_size)
                 if not chunk:
-                    # 프로세스가 종료되었고 더 이상 읽을 데이터가 없으면 루프 탈출
                     if process.poll() is not None:
                         break
-                    # 데이터는 없는데 프로세스는 살아있다면 잠시 대기하거나 loop 계속
                     continue
                 yield chunk
-                
         except GeneratorExit:
-            # Generator가 외부에서 close() 되었을 때 정리
             process.kill()
             raise
         except Exception as e:
             process.kill()
             raise e
         finally:
-            # 7. Cleanup
+            # 7. 리소스 정리
             process.wait()
             video_thread.join()
             if server_socket:
@@ -585,14 +559,14 @@ class Composition:
             if audio_thread:
                 audio_thread.join()
             
-            # 비디오 스레드에서 에러가 발생했다면 여기서 re-raise
+            # 비디오 스레드에서 에러 발생 시 전파
             if video_exception:
                 raise RuntimeError(f"Video rendering error: {video_exception}")
             
+            # FFmpeg 프로세스가 에러로 종료된 경우 stderr 출력
             if process.returncode != 0:
-                # stderr 읽기 (이미 파이프가 닫혔을 수도 있음)
-                stderr_out = process.stderr.read()
-                raise RuntimeError(f"FFmpeg returned non-zero code: {process.returncode}\n{stderr_out.decode('utf-8', errors='ignore')}")
+                stderr_out = process.stderr.read().decode('utf-8', errors='ignore')
+                raise RuntimeError(f"FFmpeg returned non-zero code: {process.returncode}\n{stderr_out}")
 
     def _write_video(
         self, start_time: float, end_time: float,
@@ -1036,7 +1010,7 @@ class LayerItem:
         if audio is None:
             return None
         scale = _get_scale_by_block(
-            self.audio_level, layer_time_start, audio.shape[1])
+            self.audio_level, layer_time_start, audio.shape[1])        
         return layer_time_start, layer_time_end, scale * audio
 
     def __repr__(self) -> str:
@@ -1126,10 +1100,34 @@ def _get_T2(p: TransformValue, size: tuple[int, int], origin_point: Direction) -
     return T2
 
 
+# def _get_scale_by_block(audio_level: Attribute, start_time: float, n_samples: int) -> np.ndarray:
+#     n_blocks = (n_samples + AUDIO_BLOCK_SIZE - 1) // AUDIO_BLOCK_SIZE
+#     block_times = start_time + np.arange(n_blocks) * (AUDIO_BLOCK_SIZE / AUDIO_SAMPLING_RATE)
+#     block_level = audio_level.get_values(block_times)
+#     block_scale = 10.0 ** (block_level / 20.0)
+#     C = block_scale.shape[1]
+#     scale = np.broadcast_to(
+#         block_scale.transpose().reshape(C, n_blocks, 1),
+#         (C, n_blocks, AUDIO_BLOCK_SIZE)).reshape(C, n_blocks * AUDIO_BLOCK_SIZE)
+#     return scale[:, :n_samples]
+
+
 def _get_scale_by_block(audio_level: Attribute, start_time: float, n_samples: int) -> np.ndarray:
+    """
+    Returns per-sample linear gain (np.ndarray) safely.
+    """
     n_blocks = (n_samples + AUDIO_BLOCK_SIZE - 1) // AUDIO_BLOCK_SIZE
     block_times = start_time + np.arange(n_blocks) * (AUDIO_BLOCK_SIZE / AUDIO_SAMPLING_RATE)
     block_level = audio_level.get_values(block_times)
+    block_level = np.asarray(block_level, dtype=np.float32) # numpy로 명시적 변환
+    # NaN, INF 값 제거
+    block_level = np.nan_to_num(
+        block_level,
+        nan=-120.0,     # silence
+        posinf=20.0,    # upper safe bound
+        neginf=-120.0,
+    )
+    block_level = np.clip(block_level, -120.0, 20.0) # 현실적인 dB(데시벨) 범위로 clipping
     block_scale = 10.0 ** (block_level / 20.0)
     C = block_scale.shape[1]
     scale = np.broadcast_to(
